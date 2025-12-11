@@ -4,91 +4,92 @@ import numpy as np
 import re
 
 st.title("DFS Lineup Duplication Calculator")
-st.write("Upload a Lineups CSV and Ownership CSV to estimate field-level expected dupes.")
+
+# ==========================================
+# Initialize session state for stored results
+# ==========================================
+if "df_out" not in st.session_state:
+    st.session_state.df_out = None
+if "is_showdown" not in st.session_state:
+    st.session_state.is_showdown = None
+if "fighter_cols" not in st.session_state:
+    st.session_state.fighter_cols = None
+
 
 # ======================
 # File Uploads & Inputs
 # ======================
 lineup_file = st.file_uploader("Upload Lineups CSV", type=["csv"])
 own_file = st.file_uploader("Upload Ownership CSV", type=["csv"])
-contest_size = st.number_input("Contest Size (total entries in the contest)", min_value=1, value=73529)
+contest_size = st.number_input("Contest Size", min_value=1, value=73529)
 
 # -------------
 # Helpers
 # -------------
 def salary_multiplier(s):
-    try:
-        s = float(s)
-    except:
-        return 1.0
+    try: s = float(s)
+    except: return 1.0
     if s >= 50000: return 1.75
     if s >= 49900: return 1.30
     if s >= 49800: return 1.00
     if s >= 49700: return 0.80
     return 0.60
 
-def extract_id_from_string(x):
+def extract_id(x):
     s = str(x)
     m = re.search(r"\((\d+)\)", s)
-    if m:
-        return int(m.group(1))
+    if m: return int(m.group(1))
     m2 = re.search(r"(\d+)", s)
-    if m2:
-        return int(m2.group(1))
+    if m2: return int(m2.group(1))
     return np.nan
 
+
 # ======================
-# RUN BUTTON
+# RUN DUPES BUTTON
 # ======================
 if st.button("Run Dupes"):
 
     if lineup_file is None or own_file is None:
-        st.error("Please upload BOTH a lineups CSV and an ownership CSV.")
+        st.error("Upload BOTH lineup CSV and ownership CSV.")
         st.stop()
 
-    # Load CSVs
+    # Load files
     lineups = pd.read_csv(lineup_file)
     own = pd.read_csv(own_file)
 
-    st.write("Lineups columns:", list(lineups.columns))
-    st.write("Ownership columns:", list(own.columns))
-
-    # ===== Detect format =====
+    # Detect format
     is_showdown = "CPT" in lineups.columns
+    st.session_state.is_showdown = is_showdown
+
     if is_showdown:
-        st.write("✅ Detected format: NFL Showdown (CPT + 5 FLEX).")
         fighter_cols = ["CPT", "FLEX", "FLEX.1", "FLEX.2", "FLEX.3", "FLEX.4"]
         gamma = 0.12
     else:
-        st.write("✅ Detected format: MMA / PGA (6 fighters).")
         fighter_cols = ["F", "F.1", "F.2", "F.3", "F.4", "F.5"]
         gamma = 0.10
 
-    # ========= Ownership mapping =========
-    if "DFS ID" not in own.columns:
-        st.error("Ownership file must include a 'DFS ID' column.")
-        st.stop()
+    st.session_state.fighter_cols = fighter_cols
 
+    # Ownership data
     own["DFS ID"] = own["DFS ID"].astype(int)
 
     if is_showdown:
-        flex_map = dict(zip(own["DFS ID"], own["Ownership"] / 100.0))
-        cpt_map = dict(zip(own["DFS ID"], own["CPTOwnership"] / 100.0))
+        flex_map = dict(zip(own["DFS ID"], own["Ownership"] / 100))
+        cpt_map = dict(zip(own["DFS ID"], own["CPTOwnership"] / 100))
     else:
-        own_map = dict(zip(own["DFS ID"], own["Ownership"] / 100.0))
+        own_map = dict(zip(own["DFS ID"], own["Ownership"] / 100))
 
-    # ========= Projection & salary =========
+    # Detect projection column
     proj_col = None
     for c in lineups.columns:
-        cu = c.upper()
-        if "PROJ" in cu or "MEDIAN" in cu or "FPTS" in cu or "SCORE" in cu:
+        if any(k in c.upper() for k in ["PROJ", "SCORE", "MEDIAN", "FPTS"]):
             proj_col = c
             break
-
     if proj_col is None:
-        st.error("Could not detect a projection column.")
+        st.error("Could not detect projection column.")
         st.stop()
 
+    # Salary column
     sal_col = None
     for c in lineups.columns:
         if "SAL" in c.upper():
@@ -96,120 +97,125 @@ if st.button("Run Dupes"):
             break
     if sal_col is None and "Salary" in lineups.columns:
         sal_col = "Salary"
-
     if sal_col is None:
-        st.error("Could not detect a salary column.")
+        st.error("Could not detect salary column.")
         st.stop()
 
-    st.write(f"Using projection column: **{proj_col}**")
-    st.write(f"Using salary column: **{sal_col}**")
-
-    # ========= Convert fighter columns to DFS IDs =========
+    # Convert names → DFS IDs
+    name_to_id = {}
     if "Name" in own.columns:
         own["Name_clean"] = own["Name"].astype(str).str.upper().str.strip()
         name_to_id = dict(zip(own["Name_clean"], own["DFS ID"]))
-    else:
-        name_to_id = {}
 
     for col in fighter_cols:
-        if col not in lineups.columns:
-            st.error(f"Expected lineup column '{col}' not found.")
-            st.stop()
+        tmp = lineups[col]
 
-        if not np.issubdtype(lineups[col].dtype, np.number):
-            tmp_ids = lineups[col].apply(extract_id_from_string)
-            if tmp_ids.isna().mean() > 0.5 and name_to_id:
-                tmp_ids = (
-                    lineups[col]
-                    .astype(str)
+        if not np.issubdtype(tmp.dtype, np.number):
+            ids = tmp.apply(extract_id)
+            if ids.isna().mean() > 0.3 and name_to_id:
+                ids = (
+                    tmp.astype(str)
                     .apply(lambda x: x.split("(")[0].strip().upper())
                     .map(name_to_id)
                 )
-            lineups[col] = tmp_ids
+            lineups[col] = ids
 
+    # Drop bad rows
     lineups = lineups.dropna(subset=fighter_cols).copy()
     for col in fighter_cols:
         lineups[col] = lineups[col].astype(int)
 
-    # ========= Dupes functions =========
     P_opt = lineups[proj_col].max()
 
-    def expected_dupes_showdown(row):
+    # Dupes functions
+    def expected_showdown(row):
         try:
             cpt = int(row["CPT"])
             flex_ids = [int(row[c]) for c in fighter_cols[1:]]
         except:
             return 0.0
-        prob = (cpt_map.get(cpt, 0.0001) ** 1.4)
-        for f in flex_ids:
-            prob *= flex_map.get(f, 0.0001)
-        fS = salary_multiplier(row[sal_col])
-        fP = float(np.exp(-gamma * (P_opt - row[proj_col])))
-        return contest_size * prob * fS * fP
 
-    def expected_dupes_mma(row):
+        p = (cpt_map.get(cpt, 0.0001) ** 1.4)
+        for f in flex_ids:
+            p *= flex_map.get(f, 0.0001)
+
+        return contest_size * p * salary_multiplier(row[sal_col]) * np.exp(-gamma * (P_opt - row[proj_col]))
+
+    def expected_mma(row):
         try:
             ids = [int(row[c]) for c in fighter_cols]
         except:
             return 0.0
+
         p = 1.0
         for f in ids:
             p *= own_map.get(f, 0.0001)
-        fS = salary_multiplier(row[sal_col])
-        fP = float(np.exp(-gamma * (P_opt - row[proj_col])))
-        return contest_size * p * fS * fP
 
-    # ========= Apply dupes =========
+        return contest_size * p * salary_multiplier(row[sal_col]) * np.exp(-gamma * (P_opt - row[proj_col]))
+
+    # Apply dupes
     if is_showdown:
-        lineups["Projected Dupes"] = lineups.apply(expected_dupes_showdown, axis=1)
+        lineups["Projected Dupes"] = lineups.apply(expected_showdown, axis=1)
     else:
-        lineups["Projected Dupes"] = lineups.apply(expected_dupes_mma, axis=1)
+        lineups["Projected Dupes"] = lineups.apply(expected_mma, axis=1)
 
-    # ========= Scale =========
-    raw_sum = lineups["Projected Dupes"].sum()
-    scale = contest_size / raw_sum if raw_sum > 0 else 1.0
+    scale = contest_size / max(lineups["Projected Dupes"].sum(), 1e-12)
     lineups["Projected Dupes"] *= scale
 
-    # ========= Final output =========
-    df_out = lineups.copy()
+    # Store output in session state
+    st.session_state.df_out = lineups.copy()
 
-    for col in ["expected_dupes", "expected_dupes_scaled", "combo_key"]:
-        if col in df_out.columns:
-            df_out.drop(columns=[col], inplace=True)
+    st.success("Dupes calculated! Scroll down to filter results.")
 
-    # ========= Build summary internally only =========
-    def combo_key(row):
-        try:
-            return "-".join(map(str, sorted([int(row[c]) for c in fighter_cols])))
-        except:
-            return "NA"
 
-    lineups["combo_key"] = lineups.apply(combo_key, axis=1)
-    valid = lineups[lineups["combo_key"] != "NA"].copy()
+# ===================================================
+# FILTER PANEL (only appears AFTER dupes are computed)
+# ===================================================
+if st.session_state.df_out is not None:
 
-    summary = valid.groupby("combo_key").agg({
-        "Projected Dupes": "sum",
-        proj_col: "mean",
-        sal_col: "mean"
-    }).reset_index()
+    df_out = st.session_state.df_out
+    fighter_cols = st.session_state.fighter_cols
 
-    summary = summary.drop(columns=["combo_key"])  # Clean output
+    st.header("Filter Lineups by ROI & Projected Dupes")
 
-    st.success("Duplication modeling complete.")
-    st.write(f"Scaling factor used: {scale:.3e}")
-    st.dataframe(summary.head(10))
+    # ROI column selector
+    roi_col = st.selectbox(
+        "Select ROI Column:",
+        options=df_out.columns,
+        help="Choose the ROI column (changes every slate)."
+    )
 
-    # ========= Download buttons =========
+    max_dupes = st.number_input(
+        "Maximum allowed Projected Dupes:",
+        min_value=0.0,
+        value=50.0
+    )
+
+    min_roi = st.number_input(
+        "Minimum required ROI:",
+        value=0.0
+    )
+
+    # Apply filters
+    filtered_df = df_out[
+        (df_out["Projected Dupes"] <= max_dupes) &
+        (df_out[roi_col] >= min_roi)
+    ].copy()
+
+    filtered_df = filtered_df.sort_values(by=roi_col, ascending=False)
+
+    st.write(f"### Lineups that match your criteria: {len(filtered_df)}")
+    st.dataframe(filtered_df.head(50))
+
     st.download_button(
-        label="Download Lineups With Projected Dupes CSV",
+        label="Download Filtered Lineups",
+        data=filtered_df.to_csv(index=False).encode("utf-8"),
+        file_name="filtered_lineups.csv"
+    )
+
+    # Download full results
+    st.download_button(
+        label="Download All Lineups With Projected Dupes",
         data=df_out.to_csv(index=False).encode("utf-8"),
         file_name="lineups_with_projected_dupes.csv"
     )
-
-    st.download_button(
-        label="Download Combo Summary CSV",
-        data=summary.to_csv(index=False).encode("utf-8"),
-        file_name="combo_summary.csv"
-    )
-
-
