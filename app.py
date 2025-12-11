@@ -28,12 +28,6 @@ def salary_multiplier(s):
     return 0.60
 
 def extract_id_from_string(x):
-    """
-    Handle cases like:
-    - 'Player Name (41081548)'
-    - '41081548'
-    - 'Player Name - 41081548'
-    """
     s = str(x)
     m = re.search(r"\((\d+)\)", s)
     if m:
@@ -59,7 +53,7 @@ if st.button("Run Dupes"):
     st.write("Lineups columns:", list(lineups.columns))
     st.write("Ownership columns:", list(own.columns))
 
-    # ===== Detect format (Showdown vs MMA/PGA) =====
+    # ===== Detect format =====
     is_showdown = "CPT" in lineups.columns
     if is_showdown:
         st.write("✅ Detected format: NFL Showdown (CPT + 5 FLEX).")
@@ -83,7 +77,7 @@ if st.button("Run Dupes"):
     else:
         own_map = dict(zip(own["DFS ID"], own["Ownership"] / 100.0))
 
-    # ========= Projection & salary columns detection =========
+    # ========= Projection & salary =========
     proj_col = None
     for c in lineups.columns:
         cu = c.upper()
@@ -124,83 +118,74 @@ if st.button("Run Dupes"):
 
         if not np.issubdtype(lineups[col].dtype, np.number):
             tmp_ids = lineups[col].apply(extract_id_from_string)
-
-            # fallback: name-based mapping
             if tmp_ids.isna().mean() > 0.5 and name_to_id:
-                tmp_ids = lineups[col].astype(str)\
-                                      .apply(lambda x: x.split("(")[0].strip().upper())\
-                                      .map(name_to_id)
-
+                tmp_ids = (
+                    lineups[col]
+                    .astype(str)
+                    .apply(lambda x: x.split("(")[0].strip().upper())
+                    .map(name_to_id)
+                )
             lineups[col] = tmp_ids
 
-    # Drop unmappable lineups
     lineups = lineups.dropna(subset=fighter_cols).copy()
     for col in fighter_cols:
         lineups[col] = lineups[col].astype(int)
 
-    # ========= Prepare DUPES functions =========
+    # ========= Dupes functions =========
     P_opt = lineups[proj_col].max()
 
     def expected_dupes_showdown(row):
         try:
             cpt = int(row["CPT"])
-            flex_ids = [int(row[c]) for c in ["FLEX", "FLEX.1", "FLEX.2", "FLEX.3", "FLEX.4"]]
+            flex_ids = [int(row[c]) for c in fighter_cols[1:]]
         except:
             return 0.0
-
         prob = (cpt_map.get(cpt, 0.0001) ** 1.4)
         for f in flex_ids:
             prob *= flex_map.get(f, 0.0001)
-
         fS = salary_multiplier(row[sal_col])
         fP = float(np.exp(-gamma * (P_opt - row[proj_col])))
-
         return contest_size * prob * fS * fP
 
     def expected_dupes_mma(row):
         try:
-            ids = [int(row[c]) for c in ["F", "F.1", "F.2", "F.3", "F.4", "F.5"]]
+            ids = [int(row[c]) for c in fighter_cols]
         except:
             return 0.0
-
         p = 1.0
         for f in ids:
             p *= own_map.get(f, 0.0001)
-
         fS = salary_multiplier(row[sal_col])
         fP = float(np.exp(-gamma * (P_opt - row[proj_col])))
-
         return contest_size * p * fS * fP
 
-    # ========= Apply DUPES =========
+    # ========= Apply dupes =========
     if is_showdown:
         lineups["Projected Dupes"] = lineups.apply(expected_dupes_showdown, axis=1)
     else:
         lineups["Projected Dupes"] = lineups.apply(expected_dupes_mma, axis=1)
 
-    # ========= Scale to contest size =========
+    # ========= Scale =========
     raw_sum = lineups["Projected Dupes"].sum()
     scale = contest_size / raw_sum if raw_sum > 0 else 1.0
+    lineups["Projected Dupes"] *= scale
 
-    lineups["Projected Dupes"] = lineups["Projected Dupes"] * scale
-
-    # ========= Final output (remove extras) =========
+    # ========= Final output =========
     df_out = lineups.copy()
 
-    # Remove internal-only columns if present
     for col in ["expected_dupes", "expected_dupes_scaled", "combo_key"]:
         if col in df_out.columns:
             df_out.drop(columns=[col], inplace=True)
 
-    # ========= Combo-level summary (without combo_key in output) =========
+    # ========= Build summary internally only =========
     def combo_key(row):
         try:
             return "-".join(map(str, sorted([int(row[c]) for c in fighter_cols])))
         except:
             return "NA"
 
-    df_out["combo_key"] = df_out.apply(combo_key, axis=1)
-    valid = df_out[df_out["combo_key"] != "NA"].copy()
+    lineups["combo_key"] = lineups.apply(combo_key, axis=1)
+    valid = lineups[lineups["combo_key"] != "NA"].copy()
 
     summary = valid.groupby("combo_key").agg({
         "Projected Dupes": "sum",
@@ -208,14 +193,13 @@ if st.button("Run Dupes"):
         sal_col: "mean"
     }).reset_index()
 
-    # Remove combo_key from the downloadable summary
-    summary = summary.drop(columns=["combo_key"])
+    summary = summary.drop(columns=["combo_key"])  # Clean output
 
     st.success("Duplication modeling complete.")
     st.write(f"Scaling factor used: {scale:.3e}")
     st.dataframe(summary.head(10))
 
-    # Downloads
+    # ========= Download buttons =========
     st.download_button(
         label="Download Lineups With Projected Dupes CSV",
         data=df_out.to_csv(index=False).encode("utf-8"),
@@ -227,4 +211,5 @@ if st.button("Run Dupes"):
         data=summary.to_csv(index=False).encode("utf-8"),
         file_name="combo_summary.csv"
     )
+
 
