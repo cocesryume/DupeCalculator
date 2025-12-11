@@ -174,40 +174,42 @@ if st.button("Run Dupes"):
 
     # ========= Apply DUPES =========
     if is_showdown:
-        lineups["expected_dupes"] = lineups.apply(expected_dupes_showdown, axis=1)
+        lineups["Projected Dupes"] = lineups.apply(expected_dupes_showdown, axis=1)
     else:
-        lineups["expected_dupes"] = lineups.apply(expected_dupes_mma, axis=1)
+        lineups["Projected Dupes"] = lineups.apply(expected_dupes_mma, axis=1)
 
-    # Combo key for grouping
+    # ========= Scale to contest size =========
+    raw_sum = lineups["Projected Dupes"].sum()
+    scale = contest_size / raw_sum if raw_sum > 0 else 1.0
+
+    lineups["Projected Dupes"] = lineups["Projected Dupes"] * scale
+
+    # ========= Final output (remove extras) =========
+    df_out = lineups.copy()
+
+    # Remove internal-only columns if present
+    for col in ["expected_dupes", "expected_dupes_scaled", "combo_key"]:
+        if col in df_out.columns:
+            df_out.drop(columns=[col], inplace=True)
+
+    # ========= Combo-level summary (without combo_key in output) =========
     def combo_key(row):
         try:
-            ids = sorted([int(row[c]) for c in fighter_cols])
-            return "-".join(map(str, ids))
+            return "-".join(map(str, sorted([int(row[c]) for c in fighter_cols])))
         except:
             return "NA"
 
-    lineups["combo_key"] = lineups.apply(combo_key, axis=1)
+    df_out["combo_key"] = df_out.apply(combo_key, axis=1)
+    valid = df_out[df_out["combo_key"] != "NA"].copy()
 
-    # ========= Scale to contest size =========
-    raw_sum = lineups["expected_dupes"].sum()
-    scale = contest_size / raw_sum if raw_sum > 0 else 1.0
+    summary = valid.groupby("combo_key").agg({
+        "Projected Dupes": "sum",
+        proj_col: "mean",
+        sal_col: "mean"
+    }).reset_index()
 
-    lineups["expected_dupes_scaled"] = lineups["expected_dupes"] * scale
-
-    # Move output columns to end
-    df_out = lineups.copy()
-    for col in ["expected_dupes", "expected_dupes_scaled", "combo_key"]:
-        if col in df_out.columns:
-            df_out = df_out[[c for c in df_out.columns if c != col] + [col]]
-
-    # Combo summary
-    summary = df_out[df_out["combo_key"] != "NA"] \
-        .groupby("combo_key") \
-        .agg({"expected_dupes_scaled": "sum",
-              proj_col: "mean",
-              sal_col: "mean"}) \
-        .reset_index() \
-        .sort_values("expected_dupes_scaled", ascending=False)
+    # Remove combo_key from the downloadable summary
+    summary = summary.drop(columns=["combo_key"])
 
     st.success("Duplication modeling complete.")
     st.write(f"Scaling factor used: {scale:.3e}")
@@ -215,9 +217,9 @@ if st.button("Run Dupes"):
 
     # Downloads
     st.download_button(
-        label="Download Lineups With Dupes CSV",
+        label="Download Lineups With Projected Dupes CSV",
         data=df_out.to_csv(index=False).encode("utf-8"),
-        file_name="lineups_with_dupes.csv"
+        file_name="lineups_with_projected_dupes.csv"
     )
 
     st.download_button(
