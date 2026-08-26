@@ -86,8 +86,36 @@ if st.button("Run Dupes"):
         fighter_cols = ["CPT", "FLEX", "FLEX.1", "FLEX.2", "FLEX.3", "FLEX.4"]
         gamma = 0.12
     else:
-        st.write("✅ Detected MMA / PGA (6 fighters).")
-        fighter_cols = ["F", "F.1", "F.2", "F.3", "F.4", "F.5"]
+        # MMA DraftKings exports usually use F/F.1/... while PGA exports
+        # usually use G/G.1/.... Support both instead of hard-coding F.
+        mma_cols = ["F", "F.1", "F.2", "F.3", "F.4", "F.5"]
+        pga_cols = ["G", "G.1", "G.2", "G.3", "G.4", "G.5"]
+
+        if all(c in lineups.columns for c in mma_cols):
+            fighter_cols = mma_cols
+            st.write("✅ Detected MMA (6 fighters).")
+        elif all(c in lineups.columns for c in pga_cols):
+            fighter_cols = pga_cols
+            st.write("✅ Detected PGA (6 golfers).")
+        else:
+            # Fallback: look for six repeated F or G position columns.
+            f_like = [c for c in lineups.columns if re.fullmatch(r"F(?:\.\d+)?", str(c))]
+            g_like = [c for c in lineups.columns if re.fullmatch(r"G(?:\.\d+)?", str(c))]
+
+            if len(f_like) >= 6:
+                fighter_cols = f_like[:6]
+                st.write("✅ Detected MMA (6 fighters).")
+            elif len(g_like) >= 6:
+                fighter_cols = g_like[:6]
+                st.write("✅ Detected PGA (6 golfers).")
+            else:
+                st.error(
+                    "Could not detect the 6 lineup player columns. "
+                    "Expected MMA columns F/F.1/.../F.5 or PGA columns G/G.1/.../G.5. "
+                    f"Columns found: {list(lineups.columns)}"
+                )
+                st.stop()
+
         gamma = 0.10
 
     st.session_state.fighter_cols = fighter_cols
@@ -421,4 +449,3 @@ if st.session_state.df_out is not None:
                 data=setB.to_csv(index=False).encode("utf-8"),
                 file_name="top150_setB.csv",
             )
-
