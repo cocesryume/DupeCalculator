@@ -36,7 +36,8 @@ contest_size = st.number_input("Contest Size", min_value=1, value=73529)
 # -------------
 # Helpers
 # -------------
-def salary_multiplier(s):
+def salary_multiplier_mma(s):
+    """MMA fields cluster heavily near the salary cap."""
     try:
         s = float(s)
     except Exception:
@@ -50,6 +51,32 @@ def salary_multiplier(s):
     if s >= 49700:
         return 0.80
     return 0.60
+
+
+def salary_multiplier_pga(s):
+    """PGA players leave salary more often, so use a much softer penalty."""
+    try:
+        s = float(s)
+    except Exception:
+        return 1.0
+    if s >= 50000:
+        return 1.20
+    if s >= 49900:
+        return 1.15
+    if s >= 49800:
+        return 1.10
+    if s >= 49700:
+        return 1.05
+    if s >= 49500:
+        return 1.00
+    if s >= 49200:
+        return 0.90
+    return 0.80
+
+
+def salary_multiplier_showdown(s):
+    """Keep the existing Showdown behavior unchanged."""
+    return salary_multiplier_mma(s)
 
 
 def extract_id(x):
@@ -82,31 +109,37 @@ if st.button("Run Dupes"):
     st.session_state.is_showdown = is_showdown
 
     if is_showdown:
+        sport = "SHOWDOWN"
         st.write("✅ Detected NFL Showdown (CPT + 5 FLEX).")
         fighter_cols = ["CPT", "FLEX", "FLEX.1", "FLEX.2", "FLEX.3", "FLEX.4"]
         gamma = 0.12
     else:
-        # MMA DraftKings exports usually use F/F.1/... while PGA exports
-        # usually use G/G.1/.... Support both instead of hard-coding F.
         mma_cols = ["F", "F.1", "F.2", "F.3", "F.4", "F.5"]
         pga_cols = ["G", "G.1", "G.2", "G.3", "G.4", "G.5"]
 
         if all(c in lineups.columns for c in mma_cols):
+            sport = "MMA"
             fighter_cols = mma_cols
+            gamma = 0.10
             st.write("✅ Detected MMA (6 fighters).")
         elif all(c in lineups.columns for c in pga_cols):
+            sport = "PGA"
             fighter_cols = pga_cols
+            gamma = 0.04
             st.write("✅ Detected PGA (6 golfers).")
         else:
-            # Fallback: look for six repeated F or G position columns.
             f_like = [c for c in lineups.columns if re.fullmatch(r"F(?:\.\d+)?", str(c))]
             g_like = [c for c in lineups.columns if re.fullmatch(r"G(?:\.\d+)?", str(c))]
 
             if len(f_like) >= 6:
+                sport = "MMA"
                 fighter_cols = f_like[:6]
+                gamma = 0.10
                 st.write("✅ Detected MMA (6 fighters).")
             elif len(g_like) >= 6:
+                sport = "PGA"
                 fighter_cols = g_like[:6]
+                gamma = 0.04
                 st.write("✅ Detected PGA (6 golfers).")
             else:
                 st.error(
@@ -115,8 +148,6 @@ if st.button("Run Dupes"):
                     f"Columns found: {list(lineups.columns)}"
                 )
                 st.stop()
-
-        gamma = 0.10
 
     st.session_state.fighter_cols = fighter_cols
 
@@ -267,7 +298,7 @@ if st.button("Run Dupes"):
         for f in flex_ids:
             p *= flex_map.get(f, 0.0001)
 
-        return contest_size * p * salary_multiplier(row[sal_col]) * np.exp(
+        return contest_size * p * salary_multiplier_showdown(row[sal_col]) * np.exp(
             -gamma * (P_opt - row[proj_col])
         )
 
@@ -281,19 +312,35 @@ if st.button("Run Dupes"):
         for f in ids:
             p *= own_map.get(f, 0.0001)
 
-        return contest_size * p * salary_multiplier(row[sal_col]) * np.exp(
+        return contest_size * p * salary_multiplier_mma(row[sal_col]) * np.exp(
             -gamma * (P_opt - row[proj_col])
         )
 
-    # Apply dupes
-    if is_showdown:
+    def expected_pga(row):
+        try:
+            ids = [int(row[c]) for c in fighter_cols]
+        except Exception:
+            return 0.0
+
+        p = 1.0
+        for g in ids:
+            p *= own_map.get(g, 0.0001)
+
+        return contest_size * p * salary_multiplier_pga(row[sal_col]) * np.exp(
+            -gamma * (P_opt - row[proj_col])
+        )
+
+    # Apply sport-specific dupe model.
+    if sport == "SHOWDOWN":
         lineups["Projected Dupes"] = lineups.apply(expected_showdown, axis=1)
+    elif sport == "PGA":
+        lineups["Projected Dupes"] = lineups.apply(expected_pga, axis=1)
     else:
         lineups["Projected Dupes"] = lineups.apply(expected_mma, axis=1)
 
-    total_raw = lineups["Projected Dupes"].sum()
-    scale = contest_size / total_raw if total_raw > 0 else 1.0
-    lineups["Projected Dupes"] *= scale
+    # Do not force the uploaded lineup pool to sum to the contest size.
+    # The old rescaling assumed the uploaded candidates represented the
+    # entire field, which can inflate absolute dupe estimates.
 
     # Store in session state
     st.session_state.df_out = lineups.copy()
