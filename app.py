@@ -655,6 +655,11 @@ if st.session_state.df_out is not None:
         ]
         if c is not None and c in filtered_df.columns
     ]
+
+    # Streamlit/Arrow errors if the preview requests the same column twice
+    # (for example, if the selected ROI column is already one of the columns above).
+    preview_cols = list(dict.fromkeys(preview_cols))
+
     st.dataframe(filtered_df[preview_cols].head(50))
 
     st.download_button(
