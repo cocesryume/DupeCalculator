@@ -10,7 +10,7 @@ import streamlit as st
 
 st.title("DFS Lineup Duplication Calculator")
 st.caption(
-    "PGA/MMA use a field-construction model. NFL Showdown keeps the existing model."
+    "PGA, MMA, and NFL Showdown use sport-specific field-construction dupe models."
 )
 
 # ==========================================
@@ -150,6 +150,534 @@ def detect_saber_signal(df):
         return None, []
     mat = np.vstack(sig)
     return np.nanmean(mat, axis=0), usable
+
+
+
+def showdown_key(row, cpt_col, flex_cols):
+    """Canonical Showdown key: CPT role matters; FLEX order does not."""
+    try:
+        cpt = int(row[cpt_col])
+        flex = tuple(sorted(int(row[c]) for c in flex_cols))
+        if len(flex) != 5 or len(set(flex)) != 5 or cpt in flex:
+            return None
+        return (cpt,) + flex
+    except Exception:
+        return None
+
+
+def build_showdown_maps(salary_df):
+    """
+    Map DK CPT IDs and FLEX IDs to one base/FLEX player ID while preserving role.
+    Also return team/position/base salary metadata keyed by base ID.
+    """
+    required = {"Name", "ID", "Roster Position", "Salary"}
+    if not required.issubset(set(salary_df.columns)):
+        raise ValueError(
+            "Showdown DK Salaries file must include Name, ID, Roster Position, and Salary."
+        )
+
+    sal = salary_df.copy()
+    sal["ID"] = pd.to_numeric(sal["ID"], errors="coerce")
+    sal["Salary"] = pd.to_numeric(sal["Salary"], errors="coerce")
+    sal = sal.dropna(subset=["ID", "Salary"]).copy()
+    sal["ID"] = sal["ID"].astype(int)
+
+    id_to_base = {}
+    base_meta = {}
+
+    for name, grp in sal.groupby("Name", dropna=False):
+        grp = grp.copy()
+        rp = grp["Roster Position"].astype(str).str.upper()
+
+        flex_rows = grp[rp == "FLEX"]
+        cpt_rows = grp[rp == "CPT"]
+
+        # Some salary exports can have combined eligibility text. Prefer explicit FLEX.
+        if flex_rows.empty:
+            flex_rows = grp[rp.str.contains("FLEX", regex=False)]
+
+        if flex_rows.empty:
+            continue
+
+        flex_row = flex_rows.iloc[0]
+        base_id = int(flex_row["ID"])
+        base_salary = float(flex_row["Salary"])
+
+        team = ""
+        if "TeamAbbrev" in grp.columns:
+            team = str(flex_row.get("TeamAbbrev", "")).strip()
+
+        position = ""
+        if "Position" in grp.columns:
+            position = str(flex_row.get("Position", "")).strip().upper()
+
+        base_meta[base_id] = {
+            "name": str(name),
+            "team": team,
+            "position": position,
+            "salary": base_salary,
+        }
+        id_to_base[base_id] = base_id
+
+        for _, r in flex_rows.iterrows():
+            id_to_base[int(r["ID"])] = base_id
+        for _, r in cpt_rows.iterrows():
+            id_to_base[int(r["ID"])] = base_id
+
+    return id_to_base, base_meta
+
+
+def normalize_showdown_ownership(own, base_meta):
+    """
+    Infer whether Ownership is FLEX-only (~500% sum) or TOTAL roster ownership (~600% sum).
+    Returns CPT and FLEX target maps keyed by base player ID.
+    """
+    if "DFS ID" not in own.columns:
+        raise ValueError("Showdown ownership file must include 'DFS ID'.")
+    if "Ownership" not in own.columns or "CPTOwnership" not in own.columns:
+        raise ValueError(
+            "Showdown ownership file must include 'Ownership' and 'CPTOwnership'."
+        )
+
+    o = own.copy()
+    o["DFS ID"] = pd.to_numeric(o["DFS ID"], errors="coerce")
+    o["Ownership"] = pd.to_numeric(o["Ownership"], errors="coerce")
+    o["CPTOwnership"] = pd.to_numeric(o["CPTOwnership"], errors="coerce")
+    o = o.dropna(subset=["DFS ID"]).copy()
+    o["DFS ID"] = o["DFS ID"].astype(int)
+    o = o.drop_duplicates("DFS ID", keep="first")
+
+    valid_ids = set(base_meta)
+    o = o[o["DFS ID"].isin(valid_ids)].copy()
+    if o.empty:
+        raise ValueError(
+            "Could not match ownership DFS IDs to FLEX/base IDs from the DK Salaries file."
+        )
+
+    own_pct = o["Ownership"].fillna(0.0).clip(lower=0.0)
+    cpt_pct = o["CPTOwnership"].fillna(0.0).clip(lower=0.0)
+
+    own_sum = float(own_pct.sum())
+    cpt_sum = float(cpt_pct.sum())
+
+    # Auto-detect semantics.
+    # FLEX-only ownership should sum near 500%; total roster ownership near 600%.
+    if own_sum >= 550.0:
+        flex_pct = (own_pct - cpt_pct).clip(lower=0.0)
+        ownership_semantics = "total ownership (FLEX target = Ownership - CPT)"
+    else:
+        flex_pct = own_pct.copy()
+        ownership_semantics = "FLEX-only ownership"
+
+    # Normalize rounding error to exactly 100% CPT and 500% FLEX.
+    cpt_arr = cpt_pct.to_numpy(dtype=float) / 100.0
+    flex_arr = flex_pct.to_numpy(dtype=float) / 100.0
+
+    if cpt_arr.sum() <= 0 or flex_arr.sum() <= 0:
+        raise ValueError("Showdown CPT/FLEX ownership projections are empty or invalid.")
+
+    cpt_arr *= 1.0 / cpt_arr.sum()
+    flex_arr *= 5.0 / flex_arr.sum()
+
+    # Individual role probabilities cannot exceed 100%.
+    cpt_arr = np.clip(cpt_arr, 1e-8, 0.999999)
+    flex_arr = np.clip(flex_arr, 1e-8, 0.999999)
+
+    cpt_map = dict(zip(o["DFS ID"].astype(int), cpt_arr))
+    flex_map = dict(zip(o["DFS ID"].astype(int), flex_arr))
+
+    return cpt_map, flex_map, {
+        "ownership_semantics": ownership_semantics,
+        "raw_ownership_sum": own_sum,
+        "raw_cpt_sum": cpt_sum,
+    }
+
+
+def showdown_structure_features(key, base_meta):
+    """
+    Showdown-specific construction features.
+    Returns team split, QB/pass-catcher correlation, RB-DST correlation, etc.
+    """
+    cpt = key[0]
+    flex = list(key[1:])
+    ids = [cpt] + flex
+
+    teams = [base_meta.get(pid, {}).get("team", "") for pid in ids]
+    pos = [base_meta.get(pid, {}).get("position", "") for pid in ids]
+
+    team_counts = Counter(t for t in teams if t)
+    counts = sorted(team_counts.values(), reverse=True)
+    max_team = counts[0] if counts else 0
+
+    # Balanced 3-3 / 4-2 constructions are the dominant optimizer patterns.
+    if max_team == 3:
+        team_balance = 1.0
+    elif max_team == 4:
+        team_balance = 0.7
+    elif max_team == 5:
+        team_balance = -0.25
+    else:
+        team_balance = -1.0
+
+    qb_ids = [pid for pid in ids if base_meta.get(pid, {}).get("position", "") == "QB"]
+    qb_count = len(qb_ids)
+
+    qb_stack_score = 0.0
+    for qid in qb_ids:
+        qteam = base_meta.get(qid, {}).get("team", "")
+        mates = 0
+        bringbacks = 0
+        for pid in ids:
+            if pid == qid:
+                continue
+            meta = base_meta.get(pid, {})
+            ppos = meta.get("position", "")
+            pteam = meta.get("team", "")
+            if ppos in {"WR", "TE"}:
+                if pteam == qteam:
+                    mates += 1
+                elif pteam and qteam and pteam != qteam:
+                    bringbacks += 1
+        qb_stack_score += min(mates, 2) * 0.55 + min(bringbacks, 2) * 0.25
+
+    rb_dst_score = 0.0
+    for pid in ids:
+        meta = base_meta.get(pid, {})
+        if meta.get("position") == "RB":
+            team = meta.get("team", "")
+            if any(
+                base_meta.get(x, {}).get("position") in {"DST", "D"}
+                and base_meta.get(x, {}).get("team") == team
+                for x in ids
+            ):
+                rb_dst_score += 0.35
+
+    # Two QBs are common in many Showdown fields; zero-QB is much less common.
+    if qb_count == 2:
+        qb_count_pref = 0.65
+    elif qb_count == 1:
+        qb_count_pref = 0.25
+    elif qb_count == 0:
+        qb_count_pref = -0.75
+    else:
+        qb_count_pref = -0.50
+
+    return team_balance, qb_stack_score, rb_dst_score, qb_count_pref
+
+
+def build_showdown_field_model(
+    lineups,
+    own,
+    salary_df,
+    proj_col,
+    sal_col,
+    contest_size,
+    candidate_field_share=0.90,
+    concentration=0.95,
+    use_saber_signal=True,
+):
+    """
+    Rebuilt NFL Showdown dupe model.
+
+    Key improvements:
+      * exact lineup identity preserves CPT role;
+      * separate CPT and FLEX ownership marginals are calibrated simultaneously;
+      * ownership semantics auto-detect total vs FLEX-only projections;
+      * smooth salary-left behavior replaces hard salary cliffs;
+      * lineup projection, joint ownership, team split, QB stacks, bring-backs,
+        RB+DST correlation, and optional SaberSim Sim Dupes shape joint probability;
+      * no forced 'sum projected dupes = contest size' normalization;
+      * projected dupes = expected OTHER entries with the exact lineup.
+    """
+    id_to_base, base_meta = build_showdown_maps(salary_df)
+    cpt_target_map, flex_target_map, own_diag = normalize_showdown_ownership(
+        own, base_meta
+    )
+
+    work = lineups.copy()
+
+    # Normalize role IDs to base/FLEX player IDs, but KEEP CPT role separate.
+    cpt_raw = pd.to_numeric(work["CPT"], errors="coerce")
+    work["_cpt_base"] = cpt_raw.map(
+        lambda x: id_to_base.get(int(x), np.nan) if pd.notna(x) else np.nan
+    )
+
+    flex_cols = ["FLEX", "FLEX.1", "FLEX.2", "FLEX.3", "FLEX.4"]
+    for c in flex_cols:
+        vals = pd.to_numeric(work[c], errors="coerce")
+        work[f"_{c}_base"] = vals.map(
+            lambda x: id_to_base.get(int(x), np.nan) if pd.notna(x) else np.nan
+        )
+
+    base_cols = ["_cpt_base"] + [f"_{c}_base" for c in flex_cols]
+    work = work.dropna(subset=base_cols).copy()
+    for c in base_cols:
+        work[c] = work[c].astype(int)
+
+    def make_key(r):
+        cpt = int(r["_cpt_base"])
+        flex = tuple(sorted(int(r[f"_{c}_base"]) for c in flex_cols))
+        if len(set(flex)) != 5 or cpt in flex:
+            return None
+        return (cpt,) + flex
+
+    work["_combo_key"] = work.apply(make_key, axis=1)
+    work = work[work["_combo_key"].notna()].copy()
+    if work.empty:
+        raise ValueError("No valid Showdown lineups remained after salary-ID mapping.")
+
+    work["_proj"] = pd.to_numeric(work[proj_col], errors="coerce")
+    work["_salary"] = pd.to_numeric(work[sal_col], errors="coerce")
+
+    # Recompute salary from role-aware DK salaries when possible.
+    # CPT salary is 1.5x base salary; FLEX is base salary.
+    def role_salary(key):
+        cpt = key[0]
+        flex = key[1:]
+        cpt_sal = 1.5 * float(base_meta.get(cpt, {}).get("salary", 0.0))
+        flex_sal = sum(float(base_meta.get(pid, {}).get("salary", 0.0)) for pid in flex)
+        return cpt_sal + flex_sal
+
+    work["_role_salary"] = work["_combo_key"].map(role_salary)
+    # Prefer the uploaded lineup salary if it is valid; otherwise reconstructed salary.
+    work["_salary"] = work["_salary"].where(work["_salary"].notna(), work["_role_salary"])
+    work["_salary_left"] = 50000.0 - work["_salary"]
+
+    def joint_log_own(key):
+        cpt = key[0]
+        flex = key[1:]
+        p = max(cpt_target_map.get(cpt, 1e-8), 1e-8)
+        for pid in flex:
+            p *= max(flex_target_map.get(pid, 1e-8), 1e-8)
+        return math.log(max(p, 1e-30))
+
+    work["_joint_log_own"] = work["_combo_key"].map(joint_log_own)
+
+    saber_signal, saber_cols = (
+        detect_saber_signal(work) if use_saber_signal else (None, [])
+    )
+    work["_saber_signal"] = saber_signal if saber_signal is not None else 0.0
+
+    structure = work["_combo_key"].map(
+        lambda k: showdown_structure_features(k, base_meta)
+    )
+    work["_team_balance"] = structure.map(lambda x: x[0])
+    work["_qb_stack"] = structure.map(lambda x: x[1])
+    work["_rb_dst"] = structure.map(lambda x: x[2])
+    work["_qb_count_pref"] = structure.map(lambda x: x[3])
+
+    # Collapse duplicate optimizer rows representing the same exact lineup.
+    combos = (
+        work.groupby("_combo_key", as_index=False)
+        .agg(
+            {
+                "_proj": "max",
+                "_salary": "max",
+                "_salary_left": "min",
+                "_joint_log_own": "max",
+                "_saber_signal": "max",
+                "_team_balance": "max",
+                "_qb_stack": "max",
+                "_rb_dst": "max",
+                "_qb_count_pref": "max",
+            }
+        )
+        .reset_index(drop=True)
+    )
+
+    if len(combos) < 10:
+        raise ValueError("Too few unique Showdown candidate lineups.")
+
+    # Build target player universe from players actually present in candidate lineups.
+    present = sorted({pid for k in combos["_combo_key"] for pid in k})
+    target_ids = [
+        pid
+        for pid in present
+        if pid in cpt_target_map and pid in flex_target_map
+    ]
+    if len(target_ids) < 6:
+        raise ValueError(
+            "Could not match enough Showdown players between ownership, salaries, and lineups."
+        )
+
+    id_to_j = {pid: j for j, pid in enumerate(target_ids)}
+
+    # Remove combos containing unmatched players.
+    mask = combos["_combo_key"].map(
+        lambda k: all(pid in id_to_j for pid in k)
+    )
+    combos = combos[mask].reset_index(drop=True)
+    if len(combos) < 10:
+        raise ValueError("Too few Showdown candidates after ownership matching.")
+
+    # Smooth construction features.
+    zp = zscore(combos["_proj"])
+    zj = zscore(combos["_joint_log_own"])
+    zd = zscore(combos["_saber_signal"])
+    zstack = zscore(
+        combos["_team_balance"]
+        + combos["_qb_stack"]
+        + combos["_rb_dst"]
+        + combos["_qb_count_pref"]
+    )
+
+    # Salary behavior is deliberately smooth. Full salary is common but not a 1.75x cliff.
+    left = combos["_salary_left"].to_numpy(dtype=float)
+    salary_score = (
+        -0.0012 * np.clip(left, 0, 2500)
+        -0.00035 * np.clip(left - 2500, 0, None)
+    )
+    zsal = zscore(salary_score)
+
+    # Mixture of plausible field-builder archetypes.
+    # name, mix, projection, joint-own, salary, structure, saber
+    archetypes = [
+        ("projection optimizer", 0.28, 1.35, 0.35, 0.55, 0.45, 0.45),
+        ("chalk optimizer",      0.26, 0.95, 1.10, 0.65, 0.40, 0.60),
+        ("stack optimizer",      0.18, 1.05, 0.35, 0.35, 1.00, 0.45),
+        ("balanced GPP",         0.16, 0.95, 0.05, 0.20, 0.55, 0.35),
+        ("contrarian GPP",       0.08, 0.85,-0.70, 0.05, 0.45, 0.20),
+        ("recreational",         0.04, 0.35, 0.70, 0.45, 0.10, 0.10),
+    ]
+
+    base = np.zeros(len(combos), dtype=float)
+    for _, mix, bp, bj, bs, bst, bd in archetypes:
+        score = float(concentration) * (
+            bp * zp + bj * zj + bs * zsal + bst * zstack + bd * zd
+        )
+        base += mix * softmax(score)
+
+    base = np.maximum(base, 1e-18)
+    base /= base.sum()
+
+    n_players = len(target_ids)
+    cpt_members = [[] for _ in range(n_players)]
+    flex_members = [[] for _ in range(n_players)]
+
+    for i, key in enumerate(combos["_combo_key"]):
+        cpt_members[id_to_j[key[0]]].append(i)
+        for pid in key[1:]:
+            flex_members[id_to_j[pid]].append(i)
+
+    cpt_members = [np.asarray(x, dtype=np.int32) for x in cpt_members]
+    flex_members = [np.asarray(x, dtype=np.int32) for x in flex_members]
+
+    cpt_targets = np.array(
+        [cpt_target_map[pid] for pid in target_ids], dtype=float
+    )
+    flex_targets = np.array(
+        [flex_target_map[pid] for pid in target_ids], dtype=float
+    )
+
+    # Normalize any tiny rounding / dropped-player error after restricting to present IDs.
+    cpt_targets *= 1.0 / cpt_targets.sum()
+    flex_targets *= 5.0 / flex_targets.sum()
+    cpt_targets = np.clip(cpt_targets, 1e-8, 0.999999)
+    flex_targets = np.clip(flex_targets, 1e-8, 0.999999)
+
+    weights = base.copy()
+    total_w = float(weights.sum())
+    max_cpt_err = np.inf
+    max_flex_err = np.inf
+    rounds = 0
+
+    # Sequential binary raking across role-specific marginals.
+    for it in range(600):
+        for members, targets in (
+            (cpt_members, cpt_targets),
+            (flex_members, flex_targets),
+        ):
+            for j, target in enumerate(targets):
+                idx = members[j]
+                if len(idx) == 0:
+                    continue
+                inside = float(weights[idx].sum())
+                outside = total_w - inside
+                if inside <= 0 or outside <= 0:
+                    continue
+
+                factor = (target * outside) / (inside * (1.0 - target))
+                factor = float(np.clip(factor, 1e-7, 1e7))
+                weights[idx] *= factor
+                total_w = outside + factor * inside
+
+        rounds = it + 1
+
+        if rounds % 10 == 0:
+            cpt_marg = np.array(
+                [
+                    weights[idx].sum() / total_w if len(idx) else 0.0
+                    for idx in cpt_members
+                ]
+            )
+            flex_marg = np.array(
+                [
+                    weights[idx].sum() / total_w if len(idx) else 0.0
+                    for idx in flex_members
+                ]
+            )
+            max_cpt_err = float(np.max(np.abs(cpt_marg - cpt_targets)))
+            max_flex_err = float(np.max(np.abs(flex_marg - flex_targets)))
+
+            if max(max_cpt_err, max_flex_err) < 0.001:
+                break
+
+    weights /= weights.sum()
+
+    # Reserve some field mass for exact combinations not represented in the uploaded pool.
+    exact_p = weights * float(candidate_field_share)
+    prob_map = dict(zip(combos["_combo_key"], exact_p))
+
+    # Map normalized keys back to ORIGINAL lineup row order.
+    def original_key(r):
+        try:
+            cpt_raw = int(r["CPT"])
+            cpt = id_to_base.get(cpt_raw)
+            flex = []
+            for c in ["FLEX", "FLEX.1", "FLEX.2", "FLEX.3", "FLEX.4"]:
+                raw = int(r[c])
+                base = id_to_base.get(raw)
+                if base is None:
+                    return None
+                flex.append(base)
+            if cpt is None or cpt in flex or len(set(flex)) != 5:
+                return None
+            return (cpt,) + tuple(sorted(flex))
+        except Exception:
+            return None
+
+    original_keys = lineups.apply(original_key, axis=1)
+    p = np.array([prob_map.get(k, 0.0) for k in original_keys], dtype=float)
+
+    lam = (float(contest_size) - 1.0) * p
+    unique_prob = np.exp(
+        (float(contest_size) - 1.0)
+        * np.log1p(-np.clip(p, 0.0, 1.0 - 1e-15))
+    )
+    p_two_plus_others = 1.0 - unique_prob - lam * unique_prob
+    p_two_plus_others = np.clip(p_two_plus_others, 0.0, 1.0)
+
+    p90_other = np.ceil(
+        lam + 1.282 * np.sqrt(np.maximum(lam, 1e-9))
+    )
+    p90_total = 1.0 + np.maximum(p90_other, 0.0)
+
+    return {
+        "exact_probability": p,
+        "projected_dupes": lam,
+        "expected_total_copies": 1.0 + lam,
+        "unique_probability": unique_prob,
+        "prob_2plus_other": p_two_plus_others,
+        "p90_total_copies": p90_total,
+    }, {
+        "unique_candidate_lineups": int(len(combos)),
+        "candidate_field_share": float(candidate_field_share),
+        "cpt_calibration_error": float(max_cpt_err),
+        "flex_calibration_error": float(max_flex_err),
+        "calibration_rounds": int(rounds),
+        "saber_columns_used": saber_cols,
+        **own_diag,
+    }
 
 
 def build_field_model(
@@ -495,65 +1023,58 @@ if st.button("Run Dupes"):
         lineups[col] = lineups[col].astype(int)
 
     # ------------------------------
-    # Showdown: preserve old behavior
+    # NFL Showdown: rebuilt role-aware field model
     # ------------------------------
     if sport_type == "showdown":
-        if "DFS ID" not in own.columns:
-            st.error("Ownership file must include DFS ID.")
-            st.stop()
-        if "Ownership" not in own.columns or "CPTOwnership" not in own.columns:
-            st.error("Showdown ownership file needs Ownership and CPTOwnership.")
-            st.stop()
-
-        own["DFS ID"] = pd.to_numeric(own["DFS ID"], errors="coerce")
-        own = own.dropna(subset=["DFS ID"]).copy()
-        own["DFS ID"] = own["DFS ID"].astype(int)
-
-        flex_map = dict(zip(own["DFS ID"], pd.to_numeric(own["Ownership"], errors="coerce").fillna(0) / 100.0))
-        cpt_map = dict(zip(own["DFS ID"], pd.to_numeric(own["CPTOwnership"], errors="coerce").fillna(0) / 100.0))
-
-        cpt_to_flex = {}
-        if {"Name", "ID", "Roster Position"}.issubset(set(sal.columns)):
-            for name, group in sal.groupby("Name"):
-                flex_rows = group[group["Roster Position"].astype(str).str.upper() == "FLEX"]
-                cpt_rows = group[group["Roster Position"].astype(str).str.upper() == "CPT"]
-                if not flex_rows.empty and not cpt_rows.empty:
-                    flex_id = int(flex_rows["ID"].iloc[0])
-                    cpt_id = int(cpt_rows["ID"].iloc[0])
-                    cpt_to_flex[cpt_id] = flex_id
-                    id_to_name[flex_id] = str(name)
-                    id_to_name[cpt_id] = str(name)
-
-        if cpt_to_flex:
-            lineups["CPT"] = lineups["CPT"].map(lambda x: cpt_to_flex.get(int(x), int(x)))
-
-        p_opt = pd.to_numeric(lineups[proj_col], errors="coerce").max()
-        gamma = 0.12
-
-        def expected_showdown(row):
+        with st.spinner("Building and calibrating the NFL Showdown field model..."):
             try:
-                cpt = int(row["CPT"])
-                flex_ids = [int(row[c]) for c in fighter_cols[1:]]
-            except Exception:
-                return 0.0
-            p = cpt_map.get(cpt, 0.0001) ** 1.4
-            for f in flex_ids:
-                p *= flex_map.get(f, 0.0001)
-            return (
-                float(contest_size)
-                * p
-                * salary_multiplier_showdown(row[sal_col])
-                * np.exp(-gamma * (p_opt - float(row[proj_col])))
+                model, diag = build_showdown_field_model(
+                    lineups=lineups,
+                    own=own,
+                    salary_df=sal,
+                    proj_col=proj_col,
+                    sal_col=sal_col,
+                    contest_size=int(contest_size),
+                    candidate_field_share=max(float(candidate_field_share), 0.90),
+                    concentration=max(float(field_concentration), 0.95),
+                    use_saber_signal=bool(use_saber_signal),
+                )
+            except Exception as e:
+                st.error(f"Showdown field model error: {e}")
+                st.stop()
+
+        lineups["Exact Lineup Probability"] = model["exact_probability"]
+        lineups["Projected Dupes"] = model["projected_dupes"]
+        lineups["Expected Total Copies"] = model["expected_total_copies"]
+        lineups["Unique Probability"] = model["unique_probability"]
+        lineups["P(2+ Other Copies)"] = model["prob_2plus_other"]
+        lineups["90th %ile Total Copies"] = model["p90_total_copies"]
+
+        st.success("NFL Showdown field model calibrated.")
+        st.write(
+            f"Unique candidate combinations: **{diag['unique_candidate_lineups']:,}**  |  "
+            f"Candidate field share: **{100 * diag['candidate_field_share']:.0f}%**  |  "
+            f"CPT calibration max error: **{100 * diag['cpt_calibration_error']:.2f} pts**  |  "
+            f"FLEX calibration max error: **{100 * diag['flex_calibration_error']:.2f} pts**"
+        )
+        st.write(
+            f"Ownership interpretation: **{diag['ownership_semantics']}** "
+            f"(raw Ownership sum {diag['raw_ownership_sum']:.1f}%, "
+            f"CPT sum {diag['raw_cpt_sum']:.1f}%)."
+        )
+        if diag["saber_columns_used"]:
+            st.write(
+                f"Relative SaberSim dupe signal used from **{len(diag['saber_columns_used'])}** "
+                "Sim Dupes column(s)."
             )
 
-        lineups["Projected Dupes"] = lineups.apply(expected_showdown, axis=1)
-        total_raw = lineups["Projected Dupes"].sum()
-        scale = float(contest_size) / total_raw if total_raw > 0 else 1.0
-        lineups["Projected Dupes"] *= scale
-        lineups["Expected Total Copies"] = 1.0 + lineups["Projected Dupes"]
-        lineups["Unique Probability"] = np.nan
-        lineups["P(2+ Other Copies)"] = np.nan
-        lineups["90th %ile Total Copies"] = np.nan
+        st.info(
+            "**Projected Dupes = expected OTHER entries with your exact CPT + 5 FLEX lineup.** "
+            "The new Showdown model calibrates CPT and FLEX ownership separately and models "
+            "salary left, lineup projection, chalk concentration, team split, QB stacks/bring-backs, "
+            "RB+DST correlation, and optional SaberSim dupe signal. It does not use the old "
+            "CPT-own^1.4 independence formula or forced contest-size rescaling."
+        )
 
     # ------------------------------
     # PGA / MMA: rebuilt field model
