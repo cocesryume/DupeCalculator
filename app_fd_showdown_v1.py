@@ -7,8 +7,12 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(page_title='FanDuel NFL Showdown Dupe Calculator', layout='wide')
-st.title('FanDuel NFL Showdown Dupe Calculator — V1')
-st.caption('Experimental FanDuel single-game dupe estimator. Uses MVP/UTIL ownership, salary usage and projection. Save results so we can calibrate against actual dupes after contests.')
+st.title('FanDuel NFL Showdown Dupe Calculator — V1.1')
+st.caption(
+    'Supports SaberSim name-based ownership files with columns like '
+    'name / fpts / util ownership / mvp ownership. If that ownership file has no DFS IDs, '
+    'upload a FanDuel player mapping file containing DFS ID + Name (Salary optional).'
+)
 
 # -----------------------------
 # Session state
@@ -25,8 +29,12 @@ for k, v in {
 # Inputs
 # -----------------------------
 lineup_file = st.file_uploader('Upload FanDuel Showdown lineups CSV', type=['csv'])
-player_file = st.file_uploader(
-    'Upload FanDuel player/projection CSV (DFS ID, Name, Salary, MVP Own, AnyFLEX Own)',
+ownership_file = st.file_uploader(
+    'Upload FanDuel ownership CSV (supports name / fpts / util ownership / mvp ownership)',
+    type=['csv'],
+)
+mapping_file = st.file_uploader(
+    'Upload FanDuel player mapping CSV (DFS ID + Name; required when ownership file has no DFS ID)',
     type=['csv'],
 )
 contest_size = st.number_input('Contest Size', min_value=1, value=50000, step=1)
@@ -46,8 +54,21 @@ def norm_id(x):
     return s
 
 
+def normalize_name(x):
+    if pd.isna(x):
+        return ''
+    s = str(x).replace('\u00a0', ' ').strip().lower()
+    s = ' '.join(s.split())
+    return s
+
+
 def pct_to_decimal(series):
-    s = series.astype(str).str.replace('%', '', regex=False).str.replace(',', '', regex=False).str.strip()
+    s = (
+        series.astype(str)
+        .str.replace('%', '', regex=False)
+        .str.replace(',', '', regex=False)
+        .str.strip()
+    )
     x = pd.to_numeric(s, errors='coerce')
     valid = x.dropna()
     if not valid.empty and valid.max() > 1.5:
@@ -55,20 +76,21 @@ def pct_to_decimal(series):
     return x
 
 
-def detect_col(df, exact=(), contains=()):
+def detect_col(df, exact=(), contains=(), exclude=()):
     lowers = {str(c).strip().lower(): c for c in df.columns}
     for e in exact:
         if e.lower() in lowers:
             return lowers[e.lower()]
     for c in df.columns:
         lc = str(c).strip().lower()
+        if exclude and any(x.lower() in lc for x in exclude):
+            continue
         if any(x.lower() in lc for x in contains):
             return c
     return None
 
 
 def salary_factor(salary, cap):
-    """Modest 'optimizer-naturalness' bump for using most of the cap."""
     left = max(float(cap) - float(salary), 0.0)
     if left <= 100:
         return 1.35
@@ -84,21 +106,28 @@ def salary_factor(salary, cap):
 
 
 def projection_factor(proj, best_proj):
-    # Keep this intentionally mild until we have FD actual-dupe history.
     gap = max(float(best_proj) - float(proj), 0.0)
     return math.exp(-0.035 * gap)
 
 
 if st.button('Run FanDuel Dupes'):
-    if lineup_file is None or player_file is None:
-        st.error('Please upload both the lineup CSV and FanDuel player/projection CSV.')
+    if lineup_file is None or ownership_file is None:
+        st.error('Please upload both the lineup CSV and ownership CSV.')
         st.stop()
 
     try:
         lineups = read_csv(lineup_file)
-        players = read_csv(player_file)
+        own = read_csv(ownership_file)
+        mapping = read_csv(mapping_file) if mapping_file is not None else None
 
-        lineup_cols = ['MVP - 1.5X Points', 'AnyFLEX', 'AnyFLEX.1', 'AnyFLEX.2', 'AnyFLEX.3', 'AnyFLEX.4']
+        lineup_cols = [
+            'MVP - 1.5X Points',
+            'AnyFLEX',
+            'AnyFLEX.1',
+            'AnyFLEX.2',
+            'AnyFLEX.3',
+            'AnyFLEX.4',
+        ]
         missing = [c for c in lineup_cols if c not in lineups.columns]
         if missing:
             raise ValueError(f'Missing expected FanDuel lineup columns: {missing}')
@@ -108,26 +137,77 @@ if st.button('Run FanDuel Dupes'):
         if proj_col is None or sal_col is None:
             raise ValueError(f'Could not detect Proj Score / Salary columns. Found: {list(lineups.columns)}')
 
-        id_col = detect_col(players, exact=['DFS ID', 'ID'])
-        name_col = detect_col(players, exact=['Name', 'Player', 'Player Name'])
-        mvp_own_col = detect_col(players, exact=['MVP Own', 'mvp ownership'], contains=['mvp own', 'mvp ownership'])
-        util_own_col = detect_col(players, exact=['AnyFLEX Own', 'util ownership'], contains=['anyflex own', 'util ownership'])
-        if None in [id_col, name_col, mvp_own_col, util_own_col]:
+        # Ownership file columns. Name-based SaberSim files are supported directly.
+        own_name_col = detect_col(own, exact=['Name', 'Player', 'Player Name'])
+        own_id_col = detect_col(own, exact=['DFS ID', 'ID', 'Player ID'])
+        mvp_own_col = detect_col(
+            own,
+            exact=['MVP Own', 'mvp ownership', 'MVP Ownership'],
+            contains=['mvp own', 'mvp ownership'],
+        )
+        util_own_col = detect_col(
+            own,
+            exact=['AnyFLEX Own', 'util ownership', 'UTIL Ownership', 'AnyFLEX Ownership'],
+            contains=['anyflex own', 'util ownership', 'anyflex ownership'],
+        )
+        if own_name_col is None or mvp_own_col is None or util_own_col is None:
             raise ValueError(
-                'Player file must contain DFS ID, Name, MVP ownership and AnyFLEX/UTIL ownership. '
-                f'Found columns: {list(players.columns)}'
+                'Ownership file must contain Name, MVP ownership and AnyFLEX/UTIL ownership. '
+                f'Found columns: {list(own.columns)}'
             )
 
-        p = players.copy()
-        p['_ID'] = p[id_col].map(norm_id)
-        p['_MVP_OWN'] = pct_to_decimal(p[mvp_own_col])
-        p['_UTIL_OWN'] = pct_to_decimal(p[util_own_col])
-        p = p.dropna(subset=['_MVP_OWN', '_UTIL_OWN'])
-        p = p[p['_ID'] != '']
+        o = own.copy()
+        o['_NAME_KEY'] = o[own_name_col].map(normalize_name)
+        o['_MVP_OWN'] = pct_to_decimal(o[mvp_own_col])
+        o['_UTIL_OWN'] = pct_to_decimal(o[util_own_col])
 
-        id_to_name = dict(zip(p['_ID'], p[name_col].astype(str).str.strip()))
-        mvp_map = dict(zip(p['_ID'], p['_MVP_OWN']))
-        util_map = dict(zip(p['_ID'], p['_UTIL_OWN']))
+        name_to_mvp = dict(
+            zip(
+                o.loc[o['_NAME_KEY'] != '', '_NAME_KEY'],
+                o.loc[o['_NAME_KEY'] != '', '_MVP_OWN'],
+            )
+        )
+        name_to_util = dict(
+            zip(
+                o.loc[o['_NAME_KEY'] != '', '_NAME_KEY'],
+                o.loc[o['_NAME_KEY'] != '', '_UTIL_OWN'],
+            )
+        )
+
+        # Build ID -> Name mapping.
+        id_to_name_key = {}
+        id_to_display_name = {}
+
+        # First, use IDs in the ownership file if present.
+        if own_id_col is not None:
+            temp = o.copy()
+            temp['_ID'] = temp[own_id_col].map(norm_id)
+            temp = temp[(temp['_ID'] != '') & (temp['_NAME_KEY'] != '')]
+            id_to_name_key.update(dict(zip(temp['_ID'], temp['_NAME_KEY'])))
+            id_to_display_name.update(dict(zip(temp['_ID'], temp[own_name_col].astype(str).str.strip())))
+
+        # Then supplement/override from the explicit mapping file.
+        if mapping is not None:
+            map_id_col = detect_col(mapping, exact=['DFS ID', 'ID', 'Player ID'])
+            map_name_col = detect_col(mapping, exact=['Name', 'Player', 'Player Name'])
+            if map_id_col is None or map_name_col is None:
+                raise ValueError(
+                    'Player mapping file must contain DFS ID and Name. '
+                    f'Found columns: {list(mapping.columns)}'
+                )
+            m = mapping.copy()
+            m['_ID'] = m[map_id_col].map(norm_id)
+            m['_NAME_KEY'] = m[map_name_col].map(normalize_name)
+            m = m[(m['_ID'] != '') & (m['_NAME_KEY'] != '')]
+            id_to_name_key.update(dict(zip(m['_ID'], m['_NAME_KEY'])))
+            id_to_display_name.update(dict(zip(m['_ID'], m[map_name_col].astype(str).str.strip())))
+
+        if not id_to_name_key:
+            raise ValueError(
+                'This ownership file is name-based and contains no DFS ID. '
+                'Please upload the FanDuel player mapping CSV with DFS ID + Name '
+                '(for example the NFL_..._FD_SHOWDOWN_....csv file).'
+            )
 
         out = lineups.copy()
         out[proj_col] = pd.to_numeric(out[proj_col], errors='coerce')
@@ -135,33 +215,44 @@ if st.button('Run FanDuel Dupes'):
         best_proj = out[proj_col].max()
 
         parsed_names = pd.DataFrame(index=out.index, columns=lineup_cols, dtype='object')
-        missing_slots = []
-
-        # Precompute slot ownership / names
         slot_owns = pd.DataFrame(index=out.index, columns=lineup_cols, dtype='float64')
+        missing_slots = []
+        missing_ids = []
+
         for c in lineup_cols:
             is_mvp = c == 'MVP - 1.5X Points'
-            lookup = mvp_map if is_mvp else util_map
+            own_map = name_to_mvp if is_mvp else name_to_util
+
             for idx, value in out[c].items():
                 pid = norm_id(value)
-                parsed_names.at[idx, c] = id_to_name.get(pid, pid)
-                own = lookup.get(pid)
-                if own is None or pd.isna(own):
-                    missing_slots.append((idx, c, pid))
-                    own = 0.0001
-                slot_owns.at[idx, c] = float(own)
+                name_key = id_to_name_key.get(pid, '')
+                display_name = id_to_display_name.get(pid, pid)
+                parsed_names.at[idx, c] = display_name
 
-        # Build features and predicted dupes
+                if not name_key:
+                    missing_ids.append((idx, c, pid))
+                    own_value = np.nan
+                else:
+                    own_value = own_map.get(name_key, np.nan)
+
+                if pd.isna(own_value):
+                    missing_slots.append((idx, c, display_name))
+                    own_value = 0.0001
+
+                slot_owns.at[idx, c] = float(own_value)
+
         expected = []
         own_sum = []
         own_gmean = []
         salary_left = []
+
         for idx, r in out.iterrows():
             vals = [float(slot_owns.at[idx, c]) for c in lineup_cols]
-            base_prob = np.prod(vals)
+            base_prob = float(np.prod(vals))
             sf = salary_factor(r[sal_col], salary_cap)
             pf = projection_factor(r[proj_col], best_proj)
             pred = float(contest_size) * base_prob * sf * pf
+
             expected.append(pred)
             own_sum.append(100.0 * sum(vals))
             own_gmean.append(100.0 * float(np.prod(vals) ** (1.0 / len(vals))))
@@ -176,18 +267,40 @@ if st.button('Run FanDuel Dupes'):
         st.session_state.parsed_names = parsed_names
         st.session_state.player_cols = lineup_cols
 
+        total_slots = len(out) * len(lineup_cols)
+        matched_slots = total_slots - len(missing_slots)
+        coverage = 100.0 * matched_slots / total_slots if total_slots else 0.0
+
         st.success(f'Calculated FanDuel projected dupes for {len(out):,} lineups.')
         st.write(f'Projection column: **{proj_col}** | Salary column: **{sal_col}**')
-        st.write(f'Player mapping coverage: **{100*(1-len(missing_slots)/(len(out)*6)):.2f}%** of lineup slots matched ownership.')
+        st.write(f'Player/ownership mapping coverage: **{coverage:.2f}%** of lineup slots.')
+
+        if mapping is not None:
+            st.info('Using the separate FanDuel player mapping file to translate DFS IDs to player names.')
+        elif own_id_col is not None:
+            st.info('Using DFS IDs directly from the ownership file.')
+
+        if missing_ids:
+            with st.expander('Show lineup IDs that could not be mapped to player names'):
+                st.dataframe(
+                    pd.DataFrame(missing_ids, columns=['Row', 'Slot', 'FD ID']).drop_duplicates().head(200),
+                    use_container_width=True,
+                )
 
         if missing_slots:
-            st.warning(f'{len(missing_slots):,} lineup slots used fallback ownership because no player match was found.')
-            with st.expander('Show missing player/ownership matches'):
-                st.dataframe(pd.DataFrame(missing_slots, columns=['Row', 'Slot', 'FD ID']).head(100), use_container_width=True)
+            st.warning(
+                f'{len(missing_slots):,} lineup slots used fallback ownership because no matching '
+                'MVP/UTIL ownership was found.'
+            )
+            with st.expander('Show missing ownership matches'):
+                st.dataframe(
+                    pd.DataFrame(missing_slots, columns=['Row', 'Slot', 'Player']).drop_duplicates().head(200),
+                    use_container_width=True,
+                )
 
         sim_dupe_cols = [c for c in out.columns if 'Sim Dupes' in str(c)]
         if sim_dupe_cols:
-            st.info('SaberSim Sim Dupes columns were detected and preserved in the output so you can compare them with this experimental FD model.')
+            st.info('SaberSim Sim Dupes columns were detected and preserved for later comparison.')
 
     except Exception as exc:
         st.error(f'Could not run FanDuel dupes: {exc}')
@@ -240,7 +353,6 @@ if st.session_state.df_out is not None:
         mime='text/csv',
     )
 
-    # Optional 150-lineup portfolio split, same spirit as DK app
     st.subheader('Optional: Top 300 → Two Balanced 150-Lineup Sets')
     if st.button('Build Balanced Sets'):
         if len(filtered) < 2:
@@ -265,9 +377,10 @@ if st.session_state.df_out is not None:
                     for nm in names:
                         da[nm] += 1
                         db[nm] -= 1
-                    sa = sum(v*v for v in da.values()) + 3*(len(a)+1-len(b))**2
-                    sb = sum(v*v for v in db.values()) + 3*(len(a)-(len(b)+1))**2
+                    sa = sum(v * v for v in da.values()) + 3 * (len(a) + 1 - len(b)) ** 2
+                    sb = sum(v * v for v in db.values()) + 3 * (len(a) - (len(b) + 1)) ** 2
                     choose_a = sa <= sb
+
                 if choose_a:
                     a.append(idx)
                     for nm in names:
@@ -284,4 +397,7 @@ if st.session_state.df_out is not None:
             st.download_button('Download Set B', set_b.to_csv(index=False).encode('utf-8'), 'fd_setB.csv', 'text/csv')
 
 st.divider()
-st.caption('FD V1 is intentionally experimental. After the contest, send the actual FanDuel dupe counts plus the full pre-lock output and we can calibrate V2 on real FanDuel field behavior.')
+st.caption(
+    'FD V1.1 supports SaberSim name-based ownership files. After the contest, save the full pre-lock '
+    'output and actual FanDuel dupe counts so the model can be calibrated on real FD field behavior.'
+)
